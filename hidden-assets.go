@@ -8,9 +8,26 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-
+	"bufio"
 	"golang.org/x/net/html"
 )
+
+func getAbsoluteURL(baseURL *url.URL, attr html.Attribute) (*url.URL, error) {
+
+	linkURL, err := url.Parse(attr.Val)
+	if err != nil {
+		log.Println("Failed to parse URL:", err)
+		return nil, err
+	}
+
+	if !linkURL.IsAbs() {
+		resolvedURL := baseURL.ResolveReference(linkURL)
+		return resolvedURL, nil
+	}
+
+	// Return the resolved URL as a string.
+	return linkURL, nil
+}
 
 // getLinks is a function that extracts all the href values from anchor tags in an HTML document.
 // It takes a pointer to an html.Node as an argument and returns a slice of strings.
@@ -22,16 +39,8 @@ func getLinks(doc *html.Node, baseURL *url.URL) (links []string) {
 			// If the attribute is an href, append its value to the links slice.
 			if attr.Key == "href" {
 				// Parse the href value as a URL.
-				linkURL, err := url.Parse(attr.Val)
-				if err != nil {
-					log.Println("Failed to parse URL:", err)
-					continue
-				}
 
-				// If the link is a relative path, resolve it against the base URL.
-				if !linkURL.IsAbs() {
-					linkURL = baseURL.ResolveReference(linkURL)
-				}
+				linkURL, _ := getAbsoluteURL(baseURL, attr)
 
 				// Append the resolved URL to the links slice.
 				links = append(links, linkURL.String())
@@ -70,8 +79,55 @@ func getUrlArgs(flagset *flag.FlagSet) (string, error) {
 	return *u, nil
 }
 
+func writeURLsToFile(urls []string, filename string) error {
+    // Create a map to store the URLs
+    urlMap := make(map[string]bool)
+
+    // Check if the file exists
+    if _, err := os.Stat(filename); err == nil {
+        // Open the file
+        file, err := os.Open(filename)
+        if err != nil {
+            return err
+        }
+        defer file.Close()
+
+        // Read the file line by line
+        scanner := bufio.NewScanner(file)
+        for scanner.Scan() {
+            // Add each line to the map
+            urlMap[scanner.Text()] = true
+        }
+
+        // Check for errors during scanning
+        if err := scanner.Err(); err != nil {
+            return err
+        }
+    }
+
+    // Open the file in append mode
+    file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    if err != nil {
+        return err
+    }
+    defer file.Close()
+
+    // Write the URLs to the file
+    for _, u := range urls {
+        // Check if the URL is already in the file
+        if !urlMap[u] {
+            // Write the URL to the file
+            if _, err := file.WriteString(u + "\n"); err != nil {
+                return err
+            }
+        }
+    }
+
+    return nil
+}
+
 func main() {
-  flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
+	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
 	u, err := getUrlArgs(flagSet)
 	if err != nil {
 		log.Fatal("URL is required")
@@ -112,6 +168,8 @@ func main() {
 	for _, pdf := range pdfs {
 		fmt.Println(pdf)
 	}
+	
+	writeURLsToFile(pdfs, "urls.txt")
 
 	fmt.Println("Done")
 }
