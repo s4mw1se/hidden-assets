@@ -1,175 +1,229 @@
 package main
 
 import (
-	"errors"
+	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"bufio"
+	"strings"
+
 	"golang.org/x/net/html"
 )
 
-func getAbsoluteURL(baseURL *url.URL, attr html.Attribute) (*url.URL, error) {
+type Crawler struct {
+	isVisited map[string]bool
+	pdfLinks  []string
+}
 
+var allowedHosts = map[string]bool{
+	"gadoe.org":     true,
+	"www.gadoe.org": true,
+}
+
+func NewCrawler() *Crawler {
+	return &Crawler{
+		isVisited: make(map[string]bool),
+	}
+}
+
+func isAllowed(url *url.URL) bool {
+	for hostPattern := range allowedHosts {
+		match, _ := pathMatchesHostPattern(url.Hostname(), hostPattern)
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func pathMatchesHostPattern(path, pattern string) (bool, error) {
+	pathSegments := strings.Split(path, ".")
+	patternSegments := strings.Split(pattern, ".")
+	if len(pathSegments) != len(patternSegments) {
+		return false, nil
+	}
+	for i := range patternSegments {
+		if patternSegments[i] == "*" {
+			continue
+		}
+		if patternSegments[i] != pathSegments[i] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (c *Crawler) getAbsoluteURL(baseURL *url.URL, attr html.Attribute) (*url.URL, error) {
 	linkURL, err := url.Parse(attr.Val)
 	if err != nil {
-		log.Println("Failed to parse URL:", err)
 		return nil, err
 	}
-
 	if !linkURL.IsAbs() {
-		resolvedURL := baseURL.ResolveReference(linkURL)
-		return resolvedURL, nil
+		return baseURL.ResolveReference(linkURL), nil
 	}
 
-	// Return the resolved URL as a string.
 	return linkURL, nil
 }
 
-// getLinks is a function that extracts all the href values from anchor tags in an HTML document.
-// It takes a pointer to an html.Node as an argument and returns a slice of strings.
-func getLinks(doc *html.Node, baseURL *url.URL) (links []string) {
-	// Check if the node is an ElementNode and if it's an anchor tag.
+func (c *Crawler) getLinks(doc *html.Node, baseURL *url.URL) {
+	var links []string
 	if doc.Type == html.ElementNode && doc.Data == "a" {
-		// Iterate over the attributes of the node.
 		for _, attr := range doc.Attr {
-			// If the attribute is an href, append its value to the links slice.
 			if attr.Key == "href" {
-				// Parse the href value as a URL.
+				linkURL, err := c.getAbsoluteURL(baseURL, attr)
 
-				linkURL, _ := getAbsoluteURL(baseURL, attr)
+				if err != nil {
+					continue
+				}
 
-				// Append the resolved URL to the links slice.
+				if linkURL.Scheme != "http" && linkURL.Scheme != "https" {
+					continue
+				}
+
+				if !isAllowed(linkURL) {
+					continue
+				}
+
+				if c.isVisited[linkURL.String()] {
+					continue
+				}
+
+				log.Print("found: ", linkURL)
+
 				links = append(links, linkURL.String())
 			}
 		}
 	}
 
-	// Iterate over the children of the current node.
-	for c := doc.FirstChild; c != nil; c = c.NextSibling {
-		// Recursively call getLinks on each child and append the results to the links slice.
-		links = append(links, getLinks(c, baseURL)...)
+	for _, link := range links {
+		log.Println("Checking link: ", link)
+		if strings.Contains(link, ".pdf") {
+			c.pdfLinks = append(c.pdfLinks, link)
+			c.isVisited[link] = true
+			continue
+		}
+
+		c.isVisited[link] = false
+
+		url_link, err := url.Parse(link)
+		if err != nil {
+			//mark invalid url as visited to avoid crawling it again
+			c.isVisited[link] = true
+			continue
+		}
+
+		c.crawl(url_link)
 	}
 
-	// Return the links slice.
-	return links
+	// write pdf links to file
+	c.writeURLsToFile("pdf_urls.txt", "pdf")
+	c.writeURLsToFile("visited_urls.json", "url")
+
+	for child := doc.FirstChild; child != nil; child = child.NextSibling {
+		c.getLinks(child, baseURL)
+	}
 }
 
-func getPdfs(links *[]string) (pdfs []string) {
-	for _, link := range *links {
-		if len(link) > 4 && link[len(link)-4:] == ".pdf" {
-			pdfs = append(pdfs, link)
+func (c *Crawler) parseHtml(url *url.URL) {
+	c.isVisited[url.String()] = true
+	resp, err := http.Get(url.String())
+
+	if err != nil {
+		log.Println("Failed to get the URL:", err)
+		return
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Println("Error:", resp.Status)
+
+	}
+
+	log.Println("Status:", resp.Status)
+
+	doc, err := html.Parse(resp.Body)
+	if err != nil {
+		log.Println("Failed to parse the HTML:", err)
+		return
+	}
+
+	log.Println("Parsed HTML for: ", url.String())
+
+	c.getLinks(doc, url)
+}
+
+func (c *Crawler) crawl(url *url.URL) {
+	if url == nil {
+		return
+	}
+
+	//check if url is in c.visitedUrl
+	if c.isVisited[url.String()] {
+		return
+	}
+
+	log.Println("Crawling:", url.String())
+
+	if !isAllowed(url) {
+		log.Println("Host not allowed:", url.Hostname())
+		return
+	}
+
+	c.parseHtml(url)
+}
+
+func (c *Crawler) writeURLsToFile(filename string, data string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if data == "pdf" {
+		for _, pdf := range c.pdfLinks {
+			if _, err := file.WriteString(pdf + "\n"); err != nil {
+				return err
+			}
 		}
 	}
-	return pdfs
-}
 
-func getUrlArgs(flagset *flag.FlagSet) (string, error) {
-	u := flagset.String("u", "", "URL to scan")
-	flagset.Parse(os.Args[1:])
+	if data == "url" {
+		jason_data, err := json.Marshal(c.isVisited)
+		if err != nil {
+			return err
+		}
 
-	if *u == "" {
-		err := errors.New("URL is required")
-		return "", err
+		file.Write(jason_data)
+
 	}
 
-	return *u, nil
+	return nil
 }
 
-func writeURLsToFile(urls []string, filename string) error {
-    // Create a map to store the URLs
-    urlMap := make(map[string]bool)
+func start_crawler(starting_url string) {
+	crawler := NewCrawler()
+	u, err := url.Parse(starting_url)
 
-    // Check if the file exists
-    if _, err := os.Stat(filename); err == nil {
-        // Open the file
-        file, err := os.Open(filename)
-        if err != nil {
-            return err
-        }
-        defer file.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
 
-        // Read the file line by line
-        scanner := bufio.NewScanner(file)
-        for scanner.Scan() {
-            // Add each line to the map
-            urlMap[scanner.Text()] = true
-        }
+	crawler.isVisited[u.String()] = false
+	crawler.crawl(u)
 
-        // Check for errors during scanning
-        if err := scanner.Err(); err != nil {
-            return err
-        }
-    }
-
-    // Open the file in append mode
-    file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-    if err != nil {
-        return err
-    }
-    defer file.Close()
-
-    // Write the URLs to the file
-    for _, u := range urls {
-        // Check if the URL is already in the file
-        if !urlMap[u] {
-            // Write the URL to the file
-            if _, err := file.WriteString(u + "\n"); err != nil {
-                return err
-            }
-        }
-    }
-
-    return nil
 }
 
 func main() {
 	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
-	u, err := getUrlArgs(flagSet)
-	if err != nil {
+	u := flagSet.String("u", "", "URL to scan")
+	flagSet.Parse(os.Args[1:])
+
+	if *u == "" {
 		log.Fatal("URL is required")
-		os.Exit(1)
 	}
 
-	url, err := url.Parse(u)
-
-	if err != nil {
-		log.Fatal(err)
-		os.Exit(1)
-	}
-
-	// Get the URL
-	resp, err := http.Get(u)
-	if err != nil {
-		log.Fatal(err)
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Fatal("Error: ", resp.Status)
-		os.Exit(1)
-	}
-
-	// Parse the HTML
-	doc, err := html.Parse(resp.Body)
-
-	if err != nil {
-		log.Fatal(err)
-		os.Exit(1)
-	}
-
-	links := getLinks(doc, url)
-
-	pdfs := getPdfs(&links)
-	for _, pdf := range pdfs {
-		fmt.Println(pdf)
-	}
-	
-	writeURLsToFile(pdfs, "urls.txt")
-
-	fmt.Println("Done")
+	start_crawler(*u)
 }
