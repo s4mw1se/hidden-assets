@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/html"
 )
@@ -15,6 +16,7 @@ import (
 type Crawler struct {
 	isVisited map[string]bool
 	pdfLinks  []string
+	visitedUrlCount int
 }
 
 var allowedHosts = map[string]bool{
@@ -25,6 +27,8 @@ var allowedHosts = map[string]bool{
 func NewCrawler() *Crawler {
 	return &Crawler{
 		isVisited: make(map[string]bool),
+		pdfLinks:  make([]string, 0),
+		visitedUrlCount: 0,
 	}
 }
 
@@ -97,6 +101,7 @@ func (c *Crawler) getLinks(doc *html.Node, baseURL *url.URL) {
 		}
 	}
 
+	var wg sync.WaitGroup
 	for _, link := range links {
 		log.Println("Checking link: ", link)
 		if strings.Contains(link, ".pdf") {
@@ -107,15 +112,19 @@ func (c *Crawler) getLinks(doc *html.Node, baseURL *url.URL) {
 
 		c.isVisited[link] = false
 
-		url_link, err := url.Parse(link)
-		if err != nil {
-			//mark invalid url as visited to avoid crawling it again
-			c.isVisited[link] = true
-			continue
-		}
+		wg.Add(1)
+		go func(link string) {
+			defer wg.Done()
 
-		c.crawl(url_link)
+			u, err := url.Parse(link)
+			if err != nil {
+				log.Println("Invalid link:", link)
+				return
+			}
+			c.crawl(u) 
+		}(link)
 	}
+	wg.Wait()
 
 	// write pdf links to file
 	c.writeURLsToFile("pdf_urls.txt", "pdf")
@@ -165,6 +174,14 @@ func (c *Crawler) crawl(url *url.URL) {
 		return
 	}
 
+	c.isVisited[url.String()] = true
+	c.visitedUrlCount++
+	
+	if !isAllowed(url) {
+		log.Println("Host not allowed:", url.Hostname())
+		return
+	}
+	
 	log.Println("Crawling:", url.String())
 
 	if !isAllowed(url) {
@@ -174,6 +191,13 @@ func (c *Crawler) crawl(url *url.URL) {
 
 	c.parseHtml(url)
 }
+
+func (c *Crawler) flushURLs() {
+	c.writeURLsToFile("pdf_urls.txt", "pdf")
+	c.writeURLsToFile("visited_urls.json", "url")
+	c.visitedUrlCount = 0
+}
+
 
 func (c *Crawler) writeURLsToFile(filename string, data string) error {
 	file, err := os.Create(filename)
