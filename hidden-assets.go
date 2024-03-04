@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
-
+	 "io"
 	"golang.org/x/net/html"
 )
 
@@ -17,6 +17,8 @@ type Crawler struct {
 	isVisited map[string]bool
 	pdfLinks  []string
 	visitedUrlCount int
+	urlsToWrite map[string]bool
+	pdfsToWrite []string
 }
 
 var allowedHosts = map[string]bool{
@@ -29,6 +31,9 @@ func NewCrawler() *Crawler {
 		isVisited: make(map[string]bool),
 		pdfLinks:  make([]string, 0),
 		visitedUrlCount: 0,
+		urlsToWrite: make(map[string]bool),	
+		pdfsToWrite: make([]string, 0),
+
 	}
 }
 
@@ -90,13 +95,14 @@ func (c *Crawler) getLinks(doc *html.Node, baseURL *url.URL) {
 					continue
 				}
 
-				if c.isVisited[linkURL.String()] {
+				if c.urlsToWrite[linkURL.String()] {
 					continue
 				}
 
 				log.Print("found: ", linkURL)
 
 				links = append(links, linkURL.String())
+				c.urlsToWrite[linkURL.String()] = false
 			}
 		}
 	}
@@ -105,12 +111,12 @@ func (c *Crawler) getLinks(doc *html.Node, baseURL *url.URL) {
 	for _, link := range links {
 		log.Println("Checking link: ", link)
 		if strings.Contains(link, ".pdf") {
-			c.pdfLinks = append(c.pdfLinks, link)
-			c.isVisited[link] = true
+			c.pdfsToWrite = append(c.pdfsToWrite, link)
+			c.urlsToWrite[link] = true
 			continue
 		}
 
-		c.isVisited[link] = false
+		c.urlsToWrite[link] = false
 
 		wg.Add(1)
 		go func(link string) {
@@ -127,8 +133,11 @@ func (c *Crawler) getLinks(doc *html.Node, baseURL *url.URL) {
 	wg.Wait()
 
 	// write pdf links to file
-	c.writeURLsToFile("pdf_urls.txt", "pdf")
-	c.writeURLsToFile("visited_urls.json", "url")
+	if c.visitedUrlCount > 100 {
+		c.flushURLs()
+		c.writeURLsToFile("pdf_urls.txt", "pdf")
+		c.writeURLsToFile("visited_urls.json", "url")
+	}
 
 	for child := doc.FirstChild; child != nil; child = child.NextSibling {
 		c.getLinks(child, baseURL)
@@ -136,7 +145,6 @@ func (c *Crawler) getLinks(doc *html.Node, baseURL *url.URL) {
 }
 
 func (c *Crawler) parseHtml(url *url.URL) {
-	c.isVisited[url.String()] = true
 	resp, err := http.Get(url.String())
 
 	if err != nil {
@@ -175,6 +183,7 @@ func (c *Crawler) crawl(url *url.URL) {
 	}
 
 	c.isVisited[url.String()] = true
+	c.urlsToWrite[url.String()] = true
 	c.visitedUrlCount++
 	
 	if !isAllowed(url) {
@@ -207,29 +216,63 @@ func (c *Crawler) writeURLsToFile(filename string, data string) error {
 	defer file.Close()
 
 	if data == "pdf" {
-		for _, pdf := range c.pdfLinks {
+		for _, pdf := range c.pdfsToWrite{
 			if _, err := file.WriteString(pdf + "\n"); err != nil {
 				return err
 			}
 		}
+
 	}
+	c.pdfsToWrite = []string{}
 
 	if data == "url" {
-		jason_data, err := json.Marshal(c.isVisited)
+		jason_data, err := json.Marshal(c.urlsToWrite)
+		
 		if err != nil {
 			return err
 		}
-
 		file.Write(jason_data)
+		
+		for k := range c.urlsToWrite {
+			delete(c.urlsToWrite, k)
+		}
+	}
 
+
+
+	return nil
+}
+
+func (c *Crawler) loadURLsFromFile(filename string, data string) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if data == "url" {
+
+        var visitedData []byte
+        visitedData, err = io.ReadAll(file)
+        if err != nil {
+            return err
+        }
+
+        err = json.Unmarshal(visitedData, &c.isVisited)
+        if err != nil {
+            return err
+        }
 	}
 
 	return nil
 }
 
+
 func start_crawler(starting_url string) {
 	crawler := NewCrawler()
 	u, err := url.Parse(starting_url)
+
+	crawler.loadURLsFromFile("visited_urls.json", "url")
 
 	if err != nil {
 		log.Fatal(err)
@@ -244,6 +287,7 @@ func main() {
 	flagSet := flag.NewFlagSet("test", flag.ContinueOnError)
 	u := flagSet.String("u", "", "URL to scan")
 	flagSet.Parse(os.Args[1:])
+
 
 	if *u == "" {
 		log.Fatal("URL is required")
